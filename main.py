@@ -4,6 +4,7 @@ import re
 import time
 import threading
 from datetime import datetime, timedelta
+import asyncio
 
 import discord
 from discord.ext import commands, tasks
@@ -16,7 +17,7 @@ import requests
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORT = int(os.environ.get("PORT", 10000))
-PING_URL = os.environ.get("PING_URL")  # e.g., https://your-render-url.onrender.com/
+PING_URL = os.environ.get("PING_URL")
 
 # ==== FLASK SELF-PING SERVER ====
 app = Flask(__name__)
@@ -29,7 +30,7 @@ def ping_self():
     while True:
         try:
             if PING_URL:
-                requests.get(PING_URL)
+                requests.get(PING_URL, timeout=10)
         except Exception as e:
             print(f"Self-ping failed: {e}")
         time.sleep(600)  # every 10 minutes
@@ -55,12 +56,15 @@ def load_json(file, default):
     try:
         with open(file, 'r') as f:
             return json.load(f)
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         return default
 
 def save_json(file, data):
-    with open(file, 'w') as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(file, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving {file}: {e}")
 
 def load_memory():
     global conversation_memory
@@ -113,13 +117,15 @@ def format_time(seconds):
     if secs: parts.append(f"{secs}s")
     return " ".join(parts) if parts else "0s"
 
-def parse_date(date_str):
+def get_utc_timestamp():
+    """Get current UTC timestamp to avoid timezone issues"""
+    return datetime.utcnow().isoformat()
+
+def parse_utc_timestamp(timestamp_str):
+    """Parse UTC timestamp string back to datetime object"""
     try:
-        if '/' in date_str:
-            return datetime.strptime(date_str, "%d/%m/%Y")
-        elif '-' in date_str:
-            return datetime.strptime(date_str, "%d-%m-%Y")
-    except ValueError:
+        return datetime.fromisoformat(timestamp_str)
+    except (ValueError, TypeError):
         return None
 
 # ==== GEMINI SETUP ====
@@ -166,7 +172,7 @@ def build_context(user_id, current_message):
     context += f"\nCurrent message from {username}: {current_message}\n\nRespond as Nikki naturally, remembering your previous conversations:"
     return context
 
-# ==== REMINDER VIEW ====
+# ==== BULLETPROOF REMINDER SYSTEM ====
 class ReminderView(discord.ui.View):
     def __init__(self, reminder_id, user_id):
         super().__init__(timeout=None)
@@ -178,12 +184,17 @@ class ReminderView(discord.ui.View):
         if str(interaction.user.id) != self.user_id:
             await interaction.response.send_message("Only the person who set this reminder can mark it as completed!", ephemeral=True)
             return
+        
         if self.reminder_id in active_reminders:
             reminder = active_reminders[self.reminder_id]
-            reminder['next_reminder'] = (datetime.now() + timedelta(seconds=reminder['interval'])).isoformat()
+            # Calculate next reminder time from current time (not the missed time)
+            next_time = datetime.utcnow() + timedelta(seconds=reminder['interval'])
+            reminder['next_reminder'] = next_time.isoformat()
+            reminder['last_sent'] = get_utc_timestamp()
             save_reminders()
+            
             await interaction.response.edit_message(
-                content=f"✅ **Reminder completed!** Next reminder in {format_time(reminder['interval'])}.\n\n📝 **Message:** {reminder['message']}",
+                content=f"✅ **Reminder completed!** Next reminder: <t:{int(next_time.timestamp())}:R>\n\n📝 **Message:** {reminder['message']}",
                 view=self
             )
         else:
@@ -194,6 +205,7 @@ class ReminderView(discord.ui.View):
         if str(interaction.user.id) != self.user_id:
             await interaction.response.send_message("Only the person who set this reminder can revoke it!", ephemeral=True)
             return
+        
         if self.reminder_id in active_reminders:
             reminder_message = active_reminders[self.reminder_id]['message']
             del active_reminders[self.reminder_id]
@@ -205,17 +217,112 @@ class ReminderView(discord.ui.View):
         else:
             await interaction.response.edit_message(content="❌ This reminder was already revoked.", view=None)
 
+async def send_reminder(reminder_id, reminder, is_overdue=False):
+    """Send a reminder with proper error handling"""
+    try:
+        channel = bot.get_channel(reminder['channel_id'])
+        user = bot.get_user(reminder['user_id'])
+        
+        if not channel or not user:
+            print(f"Channel or user not found for reminder {reminder_id}. Removing reminder.")
+            if reminder_id in active_reminders:
+                del active_reminders[reminder_id]
+                save_reminders()
+            return False
+        
+        view = ReminderView(reminder_id, str(reminder['user_id']))
+        
+        # Calculate how late the reminder is if overdue
+        overdue_text = ""
+        if is_overdue:
+            missed_time = datetime.utcnow() - parse_utc_timestamp(reminder['next_reminder'])
+            overdue_text = f"\n⚠️ **This reminder was {format_time(int(missed_time.total_seconds()))} overdue due to bot downtime.**"
+        
+        embed = discord.Embed(
+            title="⏰ Reminder!",
+            description=f"📝 **Message:** {reminder['message']}\n\n⏱️ **Recurring every:** {format_time(reminder['interval'])}{overdue_text}",
+            color=0xffaa00 if not is_overdue else 0xff6600,
+            timestamp=datetime.utcnow()
+        )
+        embed.set_footer(text=f"Reminder ID: {reminder_id}")
+        
+        await channel.send(f"{user.mention}", embed=embed, view=view)
+        
+        # Update next reminder time and last sent timestamp
+        next_time = datetime.utcnow() + timedelta(seconds=reminder['interval'])
+        reminder['next_reminder'] = next_time.isoformat()
+        reminder['last_sent'] = get_utc_timestamp()
+        save_reminders()
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error sending reminder {reminder_id}: {e}")
+        # Don't delete reminder on temporary errors, just log
+        return False
+
+async def process_overdue_reminders():
+    """Process all overdue reminders on bot startup"""
+    current_time = datetime.utcnow()
+    overdue_count = 0
+    
+    for reminder_id, reminder in list(active_reminders.items()):
+        next_reminder_time = parse_utc_timestamp(reminder['next_reminder'])
+        
+        if not next_reminder_time:
+            print(f"Invalid timestamp for reminder {reminder_id}. Removing.")
+            del active_reminders[reminder_id]
+            continue
+        
+        if current_time >= next_reminder_time:
+            print(f"Processing overdue reminder {reminder_id}")
+            success = await send_reminder(reminder_id, reminder, is_overdue=True)
+            if success:
+                overdue_count += 1
+            # Small delay to avoid rate limits
+            await asyncio.sleep(1)
+    
+    if overdue_count > 0:
+        print(f"Processed {overdue_count} overdue reminders")
+
+@tasks.loop(seconds=30)
+async def check_reminders():
+    """Check for due reminders every 30 seconds"""
+    current_time = datetime.utcnow()
+    
+    for reminder_id, reminder in list(active_reminders.items()):
+        next_reminder_time = parse_utc_timestamp(reminder['next_reminder'])
+        
+        if not next_reminder_time:
+            continue
+        
+        if current_time >= next_reminder_time:
+            await send_reminder(reminder_id, reminder, is_overdue=False)
+            # Small delay to avoid rate limits
+            await asyncio.sleep(0.5)
+
 # ==== EVENTS ====
 @bot.event
 async def on_ready():
     print(f'{bot.user} has logged in!')
+    
+    # Load all data
     load_airdrops()
     load_memory()
     load_reminders()
+    
+    # Process any overdue reminders from downtime
+    await process_overdue_reminders()
+    
+    # Register persistent views for existing reminders
     for reminder_id, reminder in active_reminders.items():
         bot.add_view(ReminderView(reminder_id, str(reminder['user_id'])))
+    
+    # Start reminder checking task
     if not check_reminders.is_running():
         check_reminders.start()
+    
+    # Sync slash commands
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} command(s)")
@@ -226,6 +333,7 @@ async def on_ready():
 async def on_message(message):
     if message.author == bot.user:
         return
+    
     should_respond = False
     if message.channel.id == MAIN_CHANNEL_ID:
         should_respond = True
@@ -233,70 +341,54 @@ async def on_message(message):
           isinstance(message.channel, discord.DMChannel) or
           any(name in message.content.lower() for name in ['nikki', 'nikhita'])):
         should_respond = True
+    
     if should_respond:
         await handle_conversation(message)
+    
     await bot.process_commands(message)
 
 async def handle_conversation(message):
     user_id = str(message.author.id)
     user_message = message.content.replace(f'<@{bot.user.id}>', '').strip()
+    
     if user_id not in conversation_memory:
         conversation_memory[user_id] = {
             "username": message.author.display_name,
             "conversations": [],
             "user_info": {}
         }
+    
     conversation_memory[user_id]["conversations"].append({
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": get_utc_timestamp(),
         "user": user_message,
         "response": None
     })
+    
+    # Keep only last 20 conversations
     if len(conversation_memory[user_id]["conversations"]) > 20:
         conversation_memory[user_id]["conversations"] = conversation_memory[user_id]["conversations"][-20:]
+    
     context = build_context(user_id, user_message)
+    
     try:
         async with message.channel.typing():
             model = get_model()
             response = model.generate_content(context)
             bot_response = clean_response(response.text)
+            
             if len(bot_response) > 2000:
                 chunks = [bot_response[i:i+2000] for i in range(0, len(bot_response), 2000)]
                 for chunk in chunks:
                     await message.reply(chunk)
             else:
                 await message.reply(bot_response)
+            
             conversation_memory[user_id]["conversations"][-1]["response"] = bot_response
             save_memory()
+            
     except Exception as e:
         await message.reply("Ugh, something went wrong on my end 😅 Can you try again?")
-        print(f"Error: {e}")
-
-# ==== REMINDER TASK ====
-@tasks.loop(seconds=30)
-async def check_reminders():
-    current_time = datetime.now()
-    for reminder_id, reminder in list(active_reminders.items()):
-        next_reminder_time = datetime.fromisoformat(reminder['next_reminder'])
-        if current_time >= next_reminder_time:
-            try:
-                channel = bot.get_channel(reminder['channel_id'])
-                user = bot.get_user(reminder['user_id'])
-                if channel and user:
-                    view = ReminderView(reminder_id, str(reminder['user_id']))
-                    embed = discord.Embed(
-                        title="⏰ Reminder!",
-                        description=f"📝 **Message:** {reminder['message']}\n\n⏱️ **Recurring every:** {format_time(reminder['interval'])}",
-                        color=0xffaa00,
-                        timestamp=current_time
-                    )
-                    embed.set_footer(text=f"Reminder ID: {reminder_id}")
-                    await channel.send(f"{user.mention}", embed=embed, view=view)
-                    reminder['next_reminder'] = (current_time + timedelta(seconds=reminder['interval'])).isoformat()
-                    save_reminders()
-            except Exception as e:
-                print(f"Error sending reminder {reminder_id}: {e}")
-                del active_reminders[reminder_id]
-                save_reminders()
+        print(f"Conversation error: {e}")
 
 # ==== SLASH COMMANDS ====
 @bot.tree.command(name="remind", description="Set a recurring reminder")
@@ -306,6 +398,7 @@ async def check_reminders():
 )
 async def remind_slash(interaction: discord.Interaction, time_period: str, message: str):
     global reminder_id_counter
+    
     interval_seconds = parse_time_to_seconds(time_period)
     if interval_seconds is None or interval_seconds < 30:
         await interaction.response.send_message(
@@ -313,51 +406,61 @@ async def remind_slash(interaction: discord.Interaction, time_period: str, messa
             ephemeral=True
         )
         return
+    
     if len(message) > 500:
         await interaction.response.send_message("❌ **Reminder message is too long!** Maximum 500 characters.", ephemeral=True)
         return
+    
     reminder_id_counter += 1
     reminder_id = f"reminder_{reminder_id_counter}"
-    next_reminder_time = datetime.now() + timedelta(seconds=interval_seconds)
+    next_reminder_time = datetime.utcnow() + timedelta(seconds=interval_seconds)
+    
     active_reminders[reminder_id] = {
         'user_id': interaction.user.id,
         'channel_id': interaction.channel.id,
         'message': message,
         'interval': interval_seconds,
         'next_reminder': next_reminder_time.isoformat(),
-        'created_at': datetime.now().isoformat()
+        'created_at': get_utc_timestamp(),
+        'last_sent': None
     }
     save_reminders()
+    
     embed = discord.Embed(
         title="✅ Reminder Set Successfully!",
         description=f"📝 **Message:** {message}\n\n⏱️ **Recurring every:** {format_time(interval_seconds)}\n\n🕐 **First reminder:** <t:{int(next_reminder_time.timestamp())}:R>",
         color=0x00ff00,
-        timestamp=datetime.now()
+        timestamp=datetime.utcnow()
     )
-    embed.set_footer(text=f"Reminder ID: {reminder_id}")
+    embed.set_footer(text=f"Reminder ID: {reminder_id} | Bulletproof against downtime!")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="reminders", description="List all your active reminders")
 async def reminders_slash(interaction: discord.Interaction):
     user_reminders = {k: v for k, v in active_reminders.items() if v['user_id'] == interaction.user.id}
+    
     if not user_reminders:
         await interaction.response.send_message("📭 **You have no active reminders!**", ephemeral=True)
         return
+    
     embed = discord.Embed(
         title="📋 Your Active Reminders",
         color=0x0099ff,
-        timestamp=datetime.now()
+        timestamp=datetime.utcnow()
     )
+    
     for reminder_id, reminder in user_reminders.items():
-        next_time = datetime.fromisoformat(reminder['next_reminder'])
-        embed.add_field(
-            name=f"🔔 {reminder_id}",
-            value=f"**Message:** {reminder['message'][:100]}{'...' if len(reminder['message']) > 100 else ''}\n"
-                  f"**Interval:** {format_time(reminder['interval'])}\n"
-                  f"**Next:** <t:{int(next_time.timestamp())}:R>",
-            inline=False
-        )
-    embed.set_footer(text=f"Total: {len(user_reminders)} reminder(s)")
+        next_time = parse_utc_timestamp(reminder['next_reminder'])
+        if next_time:
+            embed.add_field(
+                name=f"🔔 {reminder_id}",
+                value=f"**Message:** {reminder['message'][:100]}{'...' if len(reminder['message']) > 100 else ''}\n"
+                      f"**Interval:** {format_time(reminder['interval'])}\n"
+                      f"**Next:** <t:{int(next_time.timestamp())}:R>",
+                inline=False
+            )
+    
+    embed.set_footer(text=f"Total: {len(user_reminders)} reminder(s) | Bulletproof against downtime!")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="forget", description="Clear your conversation history with Nikki")
@@ -408,6 +511,7 @@ async def stats_slash(interaction: discord.Interaction):
     total_users = len(conversation_memory)
     total_conversations = sum(len(user_data["conversations"]) for user_data in conversation_memory.values())
     total_reminders = len(active_reminders)
+    
     embed = discord.Embed(
         title="📊 Nikki's Stats",
         color=0x00ff00
@@ -416,13 +520,16 @@ async def stats_slash(interaction: discord.Interaction):
     embed.add_field(name="Total Messages", value=f"{total_conversations}", inline=True)
     embed.add_field(name="Active Reminders", value=f"{total_reminders}", inline=True)
     embed.add_field(name="Servers", value=f"{len(bot.guilds)}", inline=True)
+    
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ==== AIRDROP TRACKER (add your airdrop commands here as in your original code) ====
-# ... (for brevity, you can copy your airdrop management commands from your original code here)
 
 # ==== MAIN ====
 if __name__ == "__main__":
+    # Start Flask server in background
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
+    
+    # Start self-ping in background (helps but not sufficient for Render)
     threading.Thread(target=ping_self, daemon=True).start()
+    
+    # Run Discord bot
     bot.run(DISCORD_BOT_TOKEN)
