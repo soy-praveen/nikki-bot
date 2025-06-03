@@ -4,7 +4,8 @@ import re
 import time
 import threading
 from datetime import datetime, timedelta
-import asynciofrom bs4 import BeautifulSoup
+import asyncio
+from bs4 import BeautifulSoup
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
