@@ -2,3 +2,4 @@ discord.py
 google-generativeai
 flask
 requests
+beautifulsoup4
