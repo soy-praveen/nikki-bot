@@ -4,8 +4,7 @@ import re
 import time
 import threading
 from datetime import datetime, timedelta
-import asyncio
-
+import asynciofrom bs4 import BeautifulSoup
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -18,7 +17,10 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORT = int(os.environ.get("PORT", 10000))
 PING_URL = os.environ.get("PING_URL")
-
+CHANNEL_ID = 1379454589094596718
+ANNOUNCEMENTS_URL = "https://www.kucoin.com/announcement/new-listings"
+CHECK_INTERVAL = 600  # 10 minutes in seconds
+SEEN_FILE = "kucoin_seen.json"
 # ==== FLASK SELF-PING SERVER ====
 app = Flask(__name__)
 
@@ -301,11 +303,82 @@ async def check_reminders():
             # Small delay to avoid rate limits
             await asyncio.sleep(0.5)
 
+def load_seen():
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def save_seen(seen_ids):
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen_ids), f)
+
+def parse_announcements(html):
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    for li in soup.find_all("li"):
+        a = li.find("a", href=True)
+        if not a:
+            continue
+        url = "https://www.kucoin.com" + a["href"]
+        title_tag = a.find("h3")
+        title = title_tag.get_text(strip=True) if title_tag else "No Title"
+        ps = a.find_all("p")
+        trading_info = ps[0].get_text(strip=True) if len(ps) > 0 else ""
+        date_info = ps[1].get_text(strip=True) if len(ps) > 1 else ""
+        unique_id = a["href"]  # Use the URL path as a unique identifier
+        items.append({
+            "id": unique_id,
+            "title": title,
+            "trading_info": trading_info,
+            "date_info": date_info,
+            "url": url
+        })
+    return items
+
+async def send_announcement(channel, item):
+    embed = discord.Embed(
+        title=item["title"],
+        url=item["url"],
+        description=f"{item['trading_info']}\n\nDate: {item['date_info']}",
+        color=0x1e9fff
+    )
+    await channel.send(embed=embed)
+
+async def kucoin_announcements_task():
+    await bot.wait_until_ready()
+    seen_ids = load_seen()
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        print(f"Channel with ID {CHANNEL_ID} not found.")
+        return
+
+    while True:
+        try:
+            print("Checking KuCoin new listings...")
+            resp = requests.get(ANNOUNCEMENTS_URL, timeout=15)
+            if resp.status_code != 200:
+                print(f"Failed to fetch page: {resp.status_code}")
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+            items = parse_announcements(resp.text)
+            new_items = [item for item in items if item["id"] not in seen_ids]
+            if new_items:
+                print(f"Found {len(new_items)} new listing(s). Sending to Discord.")
+                for item in new_items:
+                    await send_announcement(channel, item)
+                    seen_ids.add(item["id"])
+                save_seen(seen_ids)
+            else:
+                print("No new listings found.")
+        except Exception as e:
+            print(f"Error in announcement task: {e}")
+        await asyncio.sleep(CHECK_INTERVAL)
 # ==== EVENTS ====
 @bot.event
 async def on_ready():
     print(f'{bot.user} has logged in!')
-    
+    bot.loop.create_task(kucoin_announcements_task())
     # Load all data
     load_airdrops()
     load_memory()
